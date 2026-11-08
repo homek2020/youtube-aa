@@ -72,7 +72,7 @@ class MusicService : MediaBrowserServiceCompat() {
 
     override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot {
         val extras = Bundle().apply {
-            putBoolean(BrowserRoot.EXTRA_FLAG_SEARCH_SUPPORTED, true)
+            putBoolean("android.media.browse.SEARCH_SUPPORTED", true)
         }
         return BrowserRoot(ROOT_ID, extras)
     }
@@ -266,7 +266,7 @@ class MusicService : MediaBrowserServiceCompat() {
 
     private fun pushMetadata(video: VideoItem) {
         session.setMetadata(
-            Builder()
+            MediaMetadataCompat.Builder()
                 .putString(METADATA_KEY_MEDIA_ID,      "video:${video.videoId}")
                 .putString(METADATA_KEY_TITLE,         video.title)
                 .putString(METADATA_KEY_ARTIST,        video.channel)

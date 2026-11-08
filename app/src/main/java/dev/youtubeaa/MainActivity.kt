@@ -83,21 +83,28 @@ fun AuthScreen(authManager: AuthManager) {
                                 deviceCode = dc.deviceCode
                             )
 
-                            // Poll until user approves or timeout
-                            repeat(60) {
-                                delay(dc.interval * 1000L)
+                            var interval = dc.interval.coerceAtLeast(1)
+                            val deadline = System.currentTimeMillis() + dc.expiresIn * 1000L
+                            while (System.currentTimeMillis() < deadline) {
+                                delay(interval * 1000L)
                                 val token = authManager.pollForToken(dc.deviceCode)
-                                if (token.accessToken != null && token.refreshToken != null) {
-                                    authManager.saveTokens(token.accessToken, token.refreshToken, token.expiresIn ?: 3600)
+                                val access = token.accessToken
+                                val refresh = token.refreshToken
+                                if (access != null && refresh != null) {
+                                    authManager.saveTokens(access, refresh, token.expiresIn ?: 3600)
                                     state = AuthState.LoggedIn
-                                    return@repeat
+                                    return@launch
                                 }
-                                if (token.error != null && token.error != "authorization_pending") {
-                                    state = AuthState.Error("Ошибка: ${token.error}")
-                                    return@repeat
+                                when (token.error) {
+                                    null, "authorization_pending" -> Unit
+                                    "slow_down" -> interval += 5
+                                    else -> {
+                                        state = AuthState.Error("Ошибка: ${token.error}")
+                                        return@launch
+                                    }
                                 }
                             }
-                            if (state !is AuthState.LoggedIn) state = AuthState.Error("Время ожидания вышло")
+                            state = AuthState.Error("Время ожидания вышло")
                         } catch (e: Exception) {
                             state = AuthState.Error(e.message ?: "Неизвестная ошибка")
                         }
