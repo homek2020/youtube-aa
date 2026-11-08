@@ -10,11 +10,21 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
-/**
- * Innertube API client for browsing (home feed, subscriptions, search).
- * Uses TVHTML5 client with Bearer token for account context.
- * Stream URL extraction is in StreamExtractor (NewPipe).
- */
+data class VideoItem(
+    val videoId: String,
+    val title: String,
+    val channel: String,
+    val thumbnailUrl: String,
+    val duration: String,
+    val views: String = ""
+)
+
+/** A single page of results plus an optional token for the next page. */
+data class FeedPage(
+    val items: List<VideoItem>,
+    val continuation: String? // null = no more pages
+)
+
 class InnertubeClient(
     private val getToken: suspend () -> String?
 ) {
@@ -27,15 +37,22 @@ class InnertubeClient(
 
     // ---- Public API ----
 
-    suspend fun getHomeFeed(): List<VideoItem> =
-        parseAnyBrowse(post("browse", browseBody("FEwhat_to_watch")))
+    suspend fun getHomeFeed(continuation: String? = null): FeedPage =
+        if (continuation == null) parseAnyBrowse(post("browse", browseBody("FEwhat_to_watch")))
+        else parseContinuation(post("browse", continuationBody(continuation)))
 
-    suspend fun getSubscriptionsFeed(): List<VideoItem> =
-        parseAnyBrowse(post("browse", browseBody("FEsubscriptions")))
+    suspend fun getSubscriptionsFeed(continuation: String? = null): FeedPage =
+        if (continuation == null) parseAnyBrowse(post("browse", browseBody("FEsubscriptions")))
+        else parseContinuation(post("browse", continuationBody(continuation)))
 
-    suspend fun search(query: String): List<VideoItem> {
-        val body = context().apply { addProperty("query", query) }
-        return parseSearchResults(post("search", body))
+    suspend fun search(query: String, continuation: String? = null): FeedPage {
+        val body = if (continuation == null) {
+            context().apply { addProperty("query", query) }
+        } else {
+            continuationBody(continuation)
+        }
+        val root = post("search", body)
+        return if (continuation == null) parseSearchResults(root) else parseContinuation(root)
     }
 
     // ---- Request builders ----
@@ -56,6 +73,9 @@ class InnertubeClient(
     private suspend fun browseBody(browseId: String) =
         context().apply { addProperty("browseId", browseId) }
 
+    private suspend fun continuationBody(token: String) =
+        context().apply { addProperty("continuation", token) }
+
     private suspend fun post(endpoint: String, body: JsonObject): JsonObject =
         withContext(Dispatchers.IO) {
             val token = getToken()
@@ -72,71 +92,106 @@ class InnertubeClient(
             gson.fromJson(resp.body?.string() ?: "{}", JsonObject::class.java)
         }
 
-    // ---- Parsers ----
+    // ---- First-page parsers ----
 
-    /**
-     * Tries multiple known response shapes:
-     *   1. TV: contents → tvBrowseRenderer → content → tvSurfaceContentRenderer → content → sectionListRenderer
-     *   2. Web fallback: contents → sectionListRenderer
-     *   3. Rich grid (home feed web): contents → richGridRenderer
-     */
-    private fun parseAnyBrowse(root: JsonObject): List<VideoItem> {
+    private fun parseAnyBrowse(root: JsonObject): FeedPage {
         val items = mutableListOf<VideoItem>()
 
-        // Path 1 — TV response
-        root.obj("contents")
+        // Path 1: TV response
+        val tvSections = root.obj("contents")
             ?.obj("tvBrowseRenderer")?.obj("content")
             ?.obj("tvSurfaceContentRenderer")?.obj("content")
-            ?.obj("sectionListRenderer")?.arr("contents")
-            ?.let { sections -> collectFromSectionList(sections, items) }
+            ?.obj("sectionListRenderer")
 
-        if (items.isNotEmpty()) return items
+        if (tvSections != null) {
+            tvSections.arr("contents")?.let { collectFromSectionList(it, items) }
+            return FeedPage(items, extractContinuation(tvSections))
+        }
 
-        // Path 2 — Web sectionListRenderer (sometimes returned for TV client too)
-        root.obj("contents")
-            ?.obj("sectionListRenderer")?.arr("contents")
-            ?.let { sections -> collectFromSectionList(sections, items) }
+        // Path 2: Web sectionListRenderer
+        val webSections = root.obj("contents")?.obj("sectionListRenderer")
+        if (webSections != null) {
+            webSections.arr("contents")?.let { collectFromSectionList(it, items) }
+            return FeedPage(items, extractContinuation(webSections))
+        }
 
-        if (items.isNotEmpty()) return items
-
-        // Path 3 — richGridRenderer (web home feed)
-        root.obj("contents")
-            ?.obj("richGridRenderer")?.arr("contents")
-            ?.forEach { el ->
-                el.asJsonObject.obj("richItemRenderer")
-                    ?.obj("content")
-                    ?.let { parseVideoRenderer(it) }
-                    ?.let { items.add(it) }
+        // Path 3: richGridRenderer (web home feed)
+        val grid = root.obj("contents")?.obj("richGridRenderer")
+        if (grid != null) {
+            grid.arr("contents")?.forEach { el ->
+                el.asJsonObject.obj("richItemRenderer")?.obj("content")
+                    ?.let { parseVideoRenderer(it) }?.let { items.add(it) }
             }
+            return FeedPage(items, extractContinuation(grid))
+        }
 
-        return items
+        return FeedPage(items, null)
     }
+
+    private fun parseSearchResults(root: JsonObject): FeedPage {
+        val items = mutableListOf<VideoItem>()
+        val sectionList = root.obj("contents")?.obj("sectionListRenderer") ?: return FeedPage(items, null)
+
+        sectionList.arr("contents")?.forEach { section ->
+            section.asJsonObject.obj("itemSectionRenderer")?.arr("contents")
+                ?.forEach { item -> parseVideoRenderer(item.asJsonObject)?.let { items.add(it) } }
+        }
+        return FeedPage(items, extractContinuation(sectionList))
+    }
+
+    // ---- Continuation-page parser ----
+
+    private fun parseContinuation(root: JsonObject): FeedPage {
+        val items = mutableListOf<VideoItem>()
+
+        val cc = root.obj("continuationContents") ?: return FeedPage(items, null)
+
+        // Browse continuation
+        val sectionCont = cc.obj("sectionListContinuation")
+        if (sectionCont != null) {
+            sectionCont.arr("contents")?.let { collectFromSectionList(it, items) }
+            return FeedPage(items, extractContinuation(sectionCont))
+        }
+
+        // Search continuation
+        val itemCont = cc.obj("itemSectionContinuation")
+        if (itemCont != null) {
+            itemCont.arr("contents")
+                ?.forEach { item -> parseVideoRenderer(item.asJsonObject)?.let { items.add(it) } }
+            return FeedPage(items, extractContinuation(itemCont))
+        }
+
+        // Rich grid continuation (home feed)
+        val gridCont = cc.obj("richGridContinuation")
+        if (gridCont != null) {
+            gridCont.arr("contents")?.forEach { el ->
+                el.asJsonObject.obj("richItemRenderer")?.obj("content")
+                    ?.let { parseVideoRenderer(it) }?.let { items.add(it) }
+            }
+            return FeedPage(items, extractContinuation(gridCont))
+        }
+
+        return FeedPage(items, null)
+    }
+
+    // ---- Shared helpers ----
 
     private fun collectFromSectionList(sections: JsonArray, out: MutableList<VideoItem>) {
         sections.forEach { section ->
             val s = section.asJsonObject
-
-            // Shelf → horizontalListRenderer
             s.obj("shelfRenderer")?.obj("content")
                 ?.obj("horizontalListRenderer")?.arr("items")
                 ?.forEach { item -> parseVideoRenderer(item.asJsonObject)?.let { out.add(it) } }
-
-            // ItemSection (subscriptions grid)
             s.obj("itemSectionRenderer")?.arr("contents")
                 ?.forEach { item -> parseVideoRenderer(item.asJsonObject)?.let { out.add(it) } }
         }
     }
 
-    private fun parseSearchResults(root: JsonObject): List<VideoItem> {
-        val items = mutableListOf<VideoItem>()
-        root.obj("contents")
-            ?.obj("sectionListRenderer")?.arr("contents")
-            ?.forEach { section ->
-                section.asJsonObject.obj("itemSectionRenderer")?.arr("contents")
-                    ?.forEach { item -> parseVideoRenderer(item.asJsonObject)?.let { items.add(it) } }
-            }
-        return items
-    }
+    private fun extractContinuation(parent: JsonObject): String? =
+        parent.arr("continuations")
+            ?.firstOrNull()?.asJsonObject
+            ?.obj("nextContinuationData")
+            ?.str("continuation")
 
     private fun parseVideoRenderer(obj: JsonObject): VideoItem? {
         val r = obj.obj("compactVideoRenderer")
@@ -145,41 +200,20 @@ class InnertubeClient(
             ?: return null
 
         val videoId = r.str("videoId") ?: return null
-
         val title = r.obj("title")?.arr("runs")?.get(0)?.asJsonObject?.str("text")
-            ?: r.obj("title")?.str("simpleText")
-            ?: return null
-
+            ?: r.obj("title")?.str("simpleText") ?: return null
         val channel = r.obj("shortBylineText")?.arr("runs")?.get(0)?.asJsonObject?.str("text")
-            ?: r.obj("longBylineText")?.arr("runs")?.get(0)?.asJsonObject?.str("text")
-            ?: ""
-
+            ?: r.obj("longBylineText")?.arr("runs")?.get(0)?.asJsonObject?.str("text") ?: ""
         val thumbnail = r.obj("thumbnail")?.arr("thumbnails")
             ?.lastOrNull()?.asJsonObject?.str("url") ?: ""
-
-        val duration = r.obj("lengthText")?.str("simpleText")
-            ?: r.obj("lengthText")?.obj("accessibility")
-                ?.obj("accessibilityData")?.str("label")
-            ?: ""
-
+        val duration = r.obj("lengthText")?.str("simpleText") ?: ""
         val views = r.obj("viewCountText")?.str("simpleText")
-            ?: r.obj("shortViewCountText")?.str("simpleText")
-            ?: ""
+            ?: r.obj("shortViewCountText")?.str("simpleText") ?: ""
 
         return VideoItem(videoId, title, channel, thumbnail, duration, views)
     }
 
-    // ---- JsonObject extensions ----
     private fun JsonObject.obj(key: String) = runCatching { getAsJsonObject(key) }.getOrNull()
     private fun JsonObject.arr(key: String) = runCatching { getAsJsonArray(key) }.getOrNull()
     private fun JsonObject.str(key: String) = runCatching { get(key)?.takeIf { !it.isJsonNull }?.asString }.getOrNull()
 }
-
-data class VideoItem(
-    val videoId: String,
-    val title: String,
-    val channel: String,
-    val thumbnailUrl: String,
-    val duration: String,
-    val views: String = ""
-)

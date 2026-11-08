@@ -29,10 +29,14 @@ class MusicService : MediaBrowserServiceCompat() {
     private lateinit var innertube: InnertubeClient
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
-    // Shared cache: mediaId → VideoItem, populated as user browses
+    // Per-section video lists for browsing + skip queue
+    private val feedCache = mutableMapOf<String, MutableList<VideoItem>>()
+    // Continuation token per section; null = no more pages
+    private val continuations = mutableMapOf<String, String?>()
+    // Flat lookup for metadata when playback starts
     private val videoCache = mutableMapOf<String, VideoItem>()
 
-    // Current playback queue (the list the user was browsing when they tapped play)
+    // Active playback queue
     private var queue: List<VideoItem> = emptyList()
     private var currentIndex: Int = -1
 
@@ -40,6 +44,7 @@ class MusicService : MediaBrowserServiceCompat() {
         const val ROOT_ID = "ROOT"
         const val HOME_ID = "HOME"
         const val SUBS_ID = "SUBSCRIPTIONS"
+        const val LOAD_MORE_PREFIX = "loadmore:"
     }
 
     override fun onCreate() {
@@ -60,9 +65,7 @@ class MusicService : MediaBrowserServiceCompat() {
         }
         sessionToken = session.sessionToken
 
-        player = ExoPlayer.Builder(this).build().apply {
-            addListener(playerListener)
-        }
+        player = ExoPlayer.Builder(this).build().apply { addListener(playerListener) }
     }
 
     // ---- Browse tree ----
@@ -75,40 +78,51 @@ class MusicService : MediaBrowserServiceCompat() {
     }
 
     override fun onLoadChildren(parentId: String, result: Result<List<MediaItem>>) {
+        if (parentId == ROOT_ID) {
+            result.sendResult(buildRootMenu())
+            return
+        }
+
         result.detach()
         scope.launch {
-            val items = when (parentId) {
-                ROOT_ID -> buildRootMenu()
-                HOME_ID -> videosToMediaItems(innertube.getHomeFeed())
-                SUBS_ID -> videosToMediaItems(innertube.getSubscriptionsFeed())
-                else -> emptyList()
+            // Return cached data immediately if available
+            if (feedCache.containsKey(parentId)) {
+                result.sendResult(buildPageItems(parentId))
+                return@launch
             }
-            result.sendResult(items)
+
+            // First load
+            val page = when (parentId) {
+                HOME_ID -> innertube.getHomeFeed()
+                SUBS_ID -> innertube.getSubscriptionsFeed()
+                else -> { result.sendResult(emptyList()); return@launch }
+            }
+
+            feedCache[parentId] = page.items.toMutableList()
+            continuations[parentId] = page.continuation
+            page.items.forEach { videoCache["video:${it.videoId}"] = it }
+
+            result.sendResult(buildPageItems(parentId))
         }
     }
 
     override fun onSearch(query: String, extras: Bundle?, result: Result<List<MediaItem>>) {
         result.detach()
         scope.launch {
-            result.sendResult(videosToMediaItems(innertube.search(query)))
+            val page = innertube.search(query)
+            page.items.forEach { videoCache["video:${it.videoId}"] = it }
+            // Store under a search key so "Load more" works for search too
+            val key = "search:$query"
+            feedCache[key] = page.items.toMutableList()
+            continuations[key] = page.continuation
+            result.sendResult(buildPageItems(key))
         }
     }
 
-    private fun buildRootMenu() = listOf(
-        folder(HOME_ID,  "Главная",   "Рекомендации"),
-        folder(SUBS_ID, "Подписки",  "Новые видео от каналов"),
-    )
-
-    private fun folder(id: String, title: String, subtitle: String) = MediaItem(
-        MediaDescriptionCompat.Builder()
-            .setMediaId(id).setTitle(title).setSubtitle(subtitle).build(),
-        MediaItem.FLAG_BROWSABLE
-    )
-
-    /** Converts a list of VideoItems to MediaItems and caches them. */
-    private fun videosToMediaItems(videos: List<VideoItem>): List<MediaItem> {
-        videos.forEach { videoCache["video:${it.videoId}"] = it }
-        return videos.map { v ->
+    /** Builds MediaItem list for a section, appending "Load more" when continuation exists. */
+    private fun buildPageItems(parentId: String): List<MediaItem> {
+        val videos = feedCache[parentId] ?: return emptyList()
+        val items = videos.map { v ->
             MediaItem(
                 MediaDescriptionCompat.Builder()
                     .setMediaId("video:${v.videoId}")
@@ -119,45 +133,92 @@ class MusicService : MediaBrowserServiceCompat() {
                     .build(),
                 MediaItem.FLAG_PLAYABLE
             )
+        }.toMutableList()
+
+        if (continuations[parentId] != null) {
+            items += MediaItem(
+                MediaDescriptionCompat.Builder()
+                    .setMediaId("$LOAD_MORE_PREFIX$parentId")
+                    .setTitle("Загрузить ещё")
+                    .setSubtitle("${videos.size} видео загружено")
+                    .build(),
+                MediaItem.FLAG_PLAYABLE
+            )
         }
+
+        return items
     }
 
-    // ---- Playback ----
+    private fun buildRootMenu() = listOf(
+        folder(HOME_ID, "Главная", "Рекомендации"),
+        folder(SUBS_ID, "Подписки", "Новые видео от каналов"),
+    )
+
+    private fun folder(id: String, title: String, subtitle: String) = MediaItem(
+        MediaDescriptionCompat.Builder()
+            .setMediaId(id).setTitle(title).setSubtitle(subtitle).build(),
+        MediaItem.FLAG_BROWSABLE
+    )
+
+    // ---- Playback callbacks ----
 
     private val sessionCallback = object : MediaSessionCompat.Callback() {
 
         override fun onPlayFromMediaId(mediaId: String?, extras: Bundle?) {
-            mediaId?.takeIf { it.startsWith("video:") } ?: return
+            mediaId ?: return
+
+            // "Load more" tapped — fetch next page and refresh the list
+            if (mediaId.startsWith(LOAD_MORE_PREFIX)) {
+                val parentId = mediaId.removePrefix(LOAD_MORE_PREFIX)
+                val token = continuations[parentId] ?: return
+                scope.launch {
+                    val page = when {
+                        parentId == HOME_ID -> innertube.getHomeFeed(token)
+                        parentId == SUBS_ID -> innertube.getSubscriptionsFeed(token)
+                        parentId.startsWith("search:") -> innertube.search(
+                            parentId.removePrefix("search:"), token
+                        )
+                        else -> return@launch
+                    }
+                    feedCache[parentId]?.addAll(page.items)
+                    continuations[parentId] = page.continuation
+                    page.items.forEach { videoCache["video:${it.videoId}"] = it }
+                    notifyChildrenChanged(parentId)
+                }
+                return
+            }
+
+            if (!mediaId.startsWith("video:")) return
             val videoId = mediaId.removePrefix("video:")
             val video = videoCache[mediaId]
 
-            // Update the active queue to the section the user was browsing.
-            // onLoadChildren sets videoCache in bulk, so we can recover the sibling list.
-            val sectionVideos = videoCache.values
-                .filter { "video:${it.videoId}" in videoCache }
-                .toList()
+            // Set queue to the section that contains this video
+            val sectionKey = feedCache.entries
+                .firstOrNull { (_, list) -> list.any { it.videoId == videoId } }
+                ?.key
+            val sectionVideos = sectionKey?.let { feedCache[it] } ?: emptyList()
+
             if (sectionVideos.isNotEmpty()) {
-                setQueue(sectionVideos)
+                queue = sectionVideos
                 currentIndex = sectionVideos.indexOfFirst { it.videoId == videoId }
+                updateSessionQueue()
             }
 
-            // Show title/thumbnail immediately — before stream is ready
             video?.let { pushMetadata(it) }
             setState(STATE_BUFFERING)
 
             scope.launch {
                 val url = StreamExtractor.getBestAudioUrl(videoId)
                 if (url == null) { setState(STATE_ERROR); return@launch }
-
                 player.setMediaItem(androidx.media3.common.MediaItem.fromUri(url))
                 player.prepare()
                 player.play()
             }
         }
 
-        override fun onPlay()           = player.play()
-        override fun onPause()          = player.pause()
-        override fun onStop()           { player.stop(); setState(STATE_STOPPED) }
+        override fun onPlay()            = player.play()
+        override fun onPause()           = player.pause()
+        override fun onStop()            { player.stop(); setState(STATE_STOPPED) }
         override fun onSeekTo(pos: Long) = player.seekTo(pos)
 
         override fun onSkipToNext() {
@@ -166,12 +227,8 @@ class MusicService : MediaBrowserServiceCompat() {
         }
 
         override fun onSkipToPrevious() {
-            if (player.currentPosition > 3_000) {
-                player.seekTo(0)
-            } else {
-                val prev = currentIndex - 1
-                if (prev >= 0) playIndex(prev)
-            }
+            if (player.currentPosition > 3_000) player.seekTo(0)
+            else { val prev = currentIndex - 1; if (prev >= 0) playIndex(prev) }
         }
 
         override fun onSetShuffleMode(shuffleMode: Int) {
@@ -193,9 +250,8 @@ class MusicService : MediaBrowserServiceCompat() {
         }
     }
 
-    private fun setQueue(videos: List<VideoItem>) {
-        queue = videos
-        session.setQueue(videos.mapIndexed { i, v ->
+    private fun updateSessionQueue() {
+        session.setQueue(queue.mapIndexed { i, v ->
             MediaSessionCompat.QueueItem(
                 MediaDescriptionCompat.Builder()
                     .setMediaId("video:${v.videoId}")
@@ -218,8 +274,6 @@ class MusicService : MediaBrowserServiceCompat() {
                 .build()
         )
     }
-
-    // ---- Player listener ----
 
     private val playerListener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
